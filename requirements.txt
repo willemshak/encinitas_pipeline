@@ -1,0 +1,11 @@
+requests
+playwright
+beautifulsoup4
+PyMuPDF
+anthropic
+chromadb
+sentence-transformers
+numpy
+rich
+flask
+python-dotenv
