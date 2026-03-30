@@ -234,6 +234,17 @@ def build_prompt(permit: dict) -> tuple[str, dict]:
                     )
                     stats["pdfs"] += 1
 
+    # ── Fallback: if still no content, use index metadata only ──
+    if not sections:
+        sections.append(
+            f"=== PERMIT INDEX METADATA (no page content available) ===\n"
+            f"Name: {permit.get('permit_name', slug)}\n"
+            f"URL: {permit.get('permit_url', '')}\n"
+            f"Department: {permit.get('department', '')}\n"
+            f"Description: {permit.get('description', '')}\n"
+        )
+        console.print(f"    [yellow]No crawled content found — using index metadata only[/yellow]")
+
     context = "\n\n".join(sections)
     stats["chars"] = len(context)
     stats["estimated_tokens"] = len(context) // 4
@@ -336,7 +347,10 @@ def extract_permit(permit: dict, client, resume: bool = False) -> dict:
             return log_entry
 
     try:
-        raw_text = response.content[0].text
+        raw_text = response.content[0].text if response.content else ""
+        if not raw_text.strip():
+            log_entry["error"] = "Empty response from API"
+            return log_entry
         log_entry["input_tokens"] = response.usage.input_tokens
         log_entry["output_tokens"] = response.usage.output_tokens
         log_entry["cost_estimate"] = round(
