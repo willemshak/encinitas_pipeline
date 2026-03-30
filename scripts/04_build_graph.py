@@ -234,15 +234,13 @@ def build_embeddings(nodes: list[dict]):
     metadatas = []
 
     for node in nodes:
-        parts = [node["name"]]
-        if node.get("description"):
-            parts.append(node["description"])
-        dept = node.get("metadata", {}).get("department")
-        if dept:
-            parts.append(f"Department: {dept}")
-        summary = node.get("metadata", {}).get("plain_english_summary")
-        if summary:
-            parts.append(summary)
+        parts = [p for p in [
+            node.get("name") or node["id"],
+            node.get("description"),
+            (f"Department: {node.get('metadata', {}).get('department')}"
+             if node.get("metadata", {}).get("department") else None),
+            node.get("metadata", {}).get("plain_english_summary"),
+        ] if p]
 
         text = ". ".join(parts)
         texts.append(text)

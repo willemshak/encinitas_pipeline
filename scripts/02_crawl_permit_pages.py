@@ -61,6 +61,15 @@ SKIP_DOMAINS = {
 PDF_PATH_PATTERNS = ["showpublisheddocument", "showdocument", "/home/showpublished"]
 # Fragments that identify the index / nav pages — don't recurse into these
 INDEX_URL_FRAGMENTS = ["applications-and-information", "/government/departments"]
+# File extensions we can't extract useful text from
+NON_EXTRACTABLE_EXTENSIONS = {
+    ".dwg", ".dxf", ".rvt",          # CAD / BIM
+    ".xlsx", ".xls", ".xlsm",        # Excel
+    ".docx", ".doc",                  # Word
+    ".pptx", ".ppt",                  # PowerPoint
+    ".zip", ".gz", ".tar",            # Archives
+    ".dwf", ".dgn",                   # Other CAD
+}
 
 # ── Registry state ─────────────────────────────────────────────────────────────
 
@@ -124,8 +133,18 @@ def slugify_filename(name: str) -> str:
     return name[:100]
 
 
+def get_url_extension(url: str) -> str:
+    return Path(urlparse(url).path).suffix.lower()
+
+
+def is_non_extractable_url(url: str) -> bool:
+    return get_url_extension(url) in NON_EXTRACTABLE_EXTENSIONS
+
+
 def is_pdf_url(url: str) -> bool:
     """Check if URL points directly to a PDF (for PDF-only permit detection)."""
+    if is_non_extractable_url(url):
+        return False  # don't misclassify .xlsx/.dwg as PDF
     lower = url.lower()
     if lower.endswith(".pdf"):
         return True
@@ -134,9 +153,11 @@ def is_pdf_url(url: str) -> bool:
 
 
 def classify_link(href: str) -> str:
-    """Classify as pdf / internal_subpage / external / anchor."""
+    """Classify as pdf / non_extractable / internal_subpage / external / anchor."""
     if href.startswith("#"):
         return "anchor"
+    if is_non_extractable_url(href):
+        return "non_extractable"
     lower = href.lower()
     path = urlparse(lower).path
     if lower.endswith(".pdf") or any(pat in path for pat in PDF_PATH_PATTERNS):
@@ -537,6 +558,24 @@ def process_subpage(
             "crawled": True}, tree_node
 
 
+def process_non_extractable(
+    link: dict,
+    permit_slug: str,
+    depth: int,
+    line_prefix: str,
+) -> tuple[dict, dict]:
+    """Record a non-extractable file link without downloading. Returns (reference, tree_node)."""
+    url = link["href"]
+    name = link.get("text", "(unnamed)")
+    ext = get_url_extension(url)
+    console.print(f"{line_prefix}[dim][{ext}][/dim] {name} — non-extractable, recorded only")
+    ref = {"type": "non_extractable", "name": name, "url": url,
+           "file_type": ext, "depth": depth}
+    node = {"type": "non_extractable", "url": url, "name": name,
+            "file_type": ext, "depth": depth, "action": "recorded"}
+    return ref, node
+
+
 def process_links(
     links: list[dict],
     permit_slug: str,
@@ -546,9 +585,9 @@ def process_links(
     dry_run: bool,
     indent: str,
 ) -> tuple[list, list]:
-    """Process all PDF and subpage links. Returns (references, tree_children)."""
-    # PDFs first, then subpages (matches natural display order)
+    """Process all PDF, non-extractable, and subpage links. Returns (references, tree_children)."""
     items = ([(l, "pdf") for l in links if l["type"] == "pdf"] +
+             [(l, "non_extractable") for l in links if l["type"] == "non_extractable"] +
              [(l, "sub") for l in links if l["type"] == "internal_subpage"])
 
     references = []
@@ -564,6 +603,9 @@ def process_links(
             ref, node = process_pdf(link, permit_slug, depth=page_depth,
                                     browser_page=browser_page, dry_run=dry_run,
                                     line_prefix=prefix)
+        elif kind == "non_extractable":
+            ref, node = process_non_extractable(link, permit_slug,
+                                                depth=page_depth, line_prefix=prefix)
         else:
             ref, node = process_subpage(link, permit_slug, subpage_depth=page_depth + 1,
                                         max_depth=max_depth, browser_page=browser_page,
@@ -595,6 +637,24 @@ def crawl_permit(
     # Resume: skip if already done
     if resume and refs_path.exists() and not dry_run:
         return {"url": url, "slug": slug, "action": "skipped"}
+
+    # Non-extractable permit URL (.xlsx, .dwg, etc.)
+    if is_non_extractable_url(url):
+        ext = get_url_extension(url)
+        console.print(f"  [dim]Non-extractable permit ({ext}) — recording URL only[/dim]")
+        ref = {"type": "non_extractable", "name": permit["permit_name"],
+               "url": url, "file_type": ext, "depth": 0}
+        if not dry_run:
+            refs_path.write_text(json.dumps({
+                "permit_slug": slug, "permit_name": permit["permit_name"],
+                "permit_type": "non_extractable", "file_type": ext,
+                "items": [ref],
+            }, indent=2))
+            _crawl_log.append({"action": "non_extractable_permit", "slug": slug,
+                               "url": url, "file_type": ext,
+                               "timestamp": datetime.now(timezone.utc).isoformat()})
+        return {"url": url, "slug": slug, "permit_name": permit["permit_name"],
+                "type": "non_extractable", "file_type": ext, "children": []}
 
     # PDF-only permit
     if is_pdf_url(url):
@@ -667,6 +727,92 @@ def crawl_permit(
             "fetch_time_ms": elapsed_ms, "children": tree_children}
 
 
+# ── Reclassify existing crawl data ────────────────────────────────────────────
+
+def _reclassify_existing(permits: list[dict]):
+    """Re-read existing links_found.json, apply updated link classification,
+    and rewrite references.json — no network requests needed."""
+    changed = 0
+    for permit in permits:
+        slug = permit["slug"]
+        url = permit["permit_url"]
+        permit_dir = config.RAW_DIR / slug
+        refs_path = permit_dir / "references.json"
+
+        # Handle permits whose own URL is non-extractable
+        if is_non_extractable_url(url):
+            ext = get_url_extension(url)
+            refs_path.write_text(json.dumps({
+                "permit_slug": slug, "permit_name": permit["permit_name"],
+                "permit_type": "non_extractable", "file_type": ext,
+                "items": [{"type": "non_extractable", "name": permit["permit_name"],
+                           "url": url, "file_type": ext, "depth": 0}],
+            }, indent=2))
+            console.print(f"  {slug}: [yellow]reclassified as non_extractable ({ext})[/yellow]")
+            changed += 1
+            continue
+
+        links_path = permit_dir / "links_found.json"
+        if not links_path.exists():
+            continue
+
+        with open(links_path) as f:
+            old_links = json.load(f)
+
+        # Re-classify each link and track changes
+        new_links = []
+        n_changed = 0
+        for link in old_links:
+            new_type = classify_link(link["href"])
+            if new_type != link.get("type"):
+                n_changed += 1
+            new_links.append({**link, "type": new_type})
+
+        if n_changed == 0:
+            continue  # nothing to update for this permit
+
+        # Rewrite links_found.json with corrected classifications
+        links_path.write_text(json.dumps(new_links, indent=2))
+
+        # Rebuild references.json from reclassified links
+        references = []
+        for link in new_links:
+            norm = normalize_url(link["href"])
+            if link["type"] == "pdf":
+                if norm in _pdf_registry:
+                    entry = _pdf_registry[norm]
+                    references.append({"type": "pdf", "name": link["text"], "url": norm,
+                                       "hash": entry["hash"], "anchor_text": link["text"],
+                                       "depth": 0})
+                # if not in registry: was never downloaded, skip
+            elif link["type"] == "non_extractable":
+                ext = get_url_extension(link["href"])
+                references.append({"type": "non_extractable", "name": link["text"],
+                                   "url": norm, "file_type": ext, "depth": 0})
+            elif link["type"] == "internal_subpage":
+                if norm in _subpage_registry:
+                    entry = _subpage_registry[norm]
+                    references.append({"type": "subpage", "name": link["text"], "url": norm,
+                                       "slug": entry["slug"], "anchor_text": link["text"],
+                                       "depth": 0, "crawled": entry.get("crawled", False)})
+
+        # Preserve existing permit_type / permit_name
+        existing = {"permit_type": "html"}
+        if refs_path.exists():
+            with open(refs_path) as f:
+                existing = json.load(f)
+        existing["items"] = references
+        refs_path.write_text(json.dumps(existing, indent=2))
+
+        console.print(f"  {slug}: {n_changed} link(s) reclassified")
+        changed += 1
+
+    console.print(f"\n[green]Reclassified {changed} permit(s).[/green]")
+    if changed:
+        console.print("[dim]Run 'python scripts/03_extract_structured.py --resume' "
+                      "to re-extract any permits whose references changed.[/dim]")
+
+
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 def main():
@@ -688,6 +834,9 @@ Run modes:
                         help=f"Max subpage recursion depth (default {config.MAX_CRAWL_DEPTH})")
     parser.add_argument("--dry-run", action="store_true",
                         help="Print what would be crawled/deduped without fetching")
+    parser.add_argument("--reclassify-only", action="store_true",
+                        help="Re-read existing links_found.json, apply updated classification, "
+                             "rewrite references.json — no network requests")
     args = parser.parse_args()
 
     load_registries()
@@ -698,6 +847,10 @@ Run modes:
         if not permits:
             console.print(f"[red]Permit '{args.permit}' not found in index[/red]")
             sys.exit(1)
+
+    if args.reclassify_only:
+        _reclassify_existing(permits)
+        return
 
     total = len(permits)
     crawl_trees: dict = {}

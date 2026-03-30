@@ -211,6 +211,7 @@ def build_prompt(permit: dict) -> tuple[str, dict]:
                                  header_type="LINKED SUB-SUBPAGE")
 
     # ── Process all references ──
+    non_extractable_files: list[str] = []
     for item in refs.get("items", []):
         kind = item.get("type")
         if kind == "pdf":
@@ -219,6 +220,18 @@ def build_prompt(permit: dict) -> tuple[str, dict]:
             _add_pdf(item, source)
         elif kind == "subpage":
             _add_subpage(item, from_label="main page")
+        elif kind == "non_extractable":
+            non_extractable_files.append(
+                f"  - {item.get('name', '?')} ({item.get('file_type', '?')}): {item.get('url', '')}"
+            )
+
+    if non_extractable_files:
+        sections.append(
+            "=== LINKED FILES (non-extractable, content not available) ===\n"
+            "The following files are linked from this permit page but cannot be read "
+            "(AutoCAD, Excel, Word, etc.). Note their existence in your extraction.\n"
+            + "\n".join(non_extractable_files)
+        )
 
     # ── PDF-only permit: just the PDF text as main content ──
     if is_pdf_only and not sections:
@@ -253,9 +266,14 @@ def build_prompt(permit: dict) -> tuple[str, dict]:
         context = context[:MAX_CONTEXT_CHARS] + "\n\n[...context truncated due to size...]"
         console.print(f"    [yellow]Context truncated to {MAX_CONTEXT_CHARS:,} chars[/yellow]")
 
-    intro = ("This permit application is a PDF document. Extract structured information from it."
-             if is_pdf_only
-             else "Extract structured data from this Encinitas, CA permit page.")
+    is_non_extractable = refs.get("permit_type") == "non_extractable"
+    if is_non_extractable:
+        intro = (f"This permit links directly to a {refs.get('file_type', 'non-PDF')} file "
+                 f"which cannot be read. Extract what you can from the metadata below.")
+    elif is_pdf_only:
+        intro = "This permit application is a PDF document. Extract structured information from it."
+    else:
+        intro = "Extract structured data from this Encinitas, CA permit page."
 
     user_prompt = f"""{intro}
 
