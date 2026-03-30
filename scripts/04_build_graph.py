@@ -224,51 +224,80 @@ def detect_shared_facts(permits: list[dict], edges: list[dict]) -> list[dict]:
     return shared_facts
 
 
-def build_embeddings(nodes: list[dict]):
-    """Step 4: Generate embeddings and store in ChromaDB."""
+def _rich_node_text(node: dict) -> str:
+    """Build a richer embedding text for a node (~200 words for permit nodes)."""
+    parts = [node.get("name") or node["id"]]
+    desc = node.get("description")
+    if desc:
+        parts.append(desc)
+
+    meta = node.get("metadata", {})
+    if meta.get("department"):
+        parts.append(f"Department: {meta['department']}")
+    if meta.get("plain_english_summary"):
+        parts.append(meta["plain_english_summary"])
+
+    # For permit nodes, include documents, steps, related permits
+    if node.get("type") == "permit":
+        steps = meta.get("process_steps", [])
+        if steps:
+            parts.append("Process steps: " + "; ".join(str(s) for s in steps[:8]))
+
+        routing = meta.get("review_routing") or {}
+        divisions = routing.get("divisions", [])
+        if divisions:
+            parts.append("Reviewed by: " + ", ".join(divisions))
+
+        fees = meta.get("fees")
+        if fees:
+            parts.append(f"Fees: {fees}")
+
+    if meta.get("condition_text"):
+        parts.append(f"Required when: {meta['condition_text']}")
+    if meta.get("document_type"):
+        parts.append(f"Document type: {meta['document_type']}")
+
+    return ". ".join(p for p in parts if p)
+
+
+def build_embeddings(nodes: list[dict], permits: list[dict]):
+    """Step 4: Generate embeddings and store in ChromaDB.
+
+    Creates two collections:
+    - encinitas_permits: one vector per graph node (richer text)
+    - encinitas_permit_content: one vector per permit with full structured JSON
+    """
     console.print("\n[bold]Building embeddings...[/bold]")
 
-    # Build contextualized text for each node
-    texts = []
-    ids = []
-    metadatas = []
-
-    for node in nodes:
-        parts = [p for p in [
-            node.get("name") or node["id"],
-            node.get("description"),
-            (f"Department: {node.get('metadata', {}).get('department')}"
-             if node.get("metadata", {}).get("department") else None),
-            node.get("metadata", {}).get("plain_english_summary"),
-        ] if p]
-
-        text = ". ".join(parts)
-        texts.append(text)
-        ids.append(node["id"])
-        metadatas.append({
-            "type": node["type"],
-            "name": node["name"],
-            "municipality": node.get("municipality", "encinitas"),
-        })
-
-    # Use sentence-transformers for embeddings
     try:
         from sentence_transformers import SentenceTransformer
-        console.print("  Using sentence-transformers (all-MiniLM-L6-v2)")
-        model = SentenceTransformer("all-MiniLM-L6-v2")
-        embeddings = model.encode(texts, show_progress_bar=True).tolist()
+        console.print("  Using sentence-transformers (all-mpnet-base-v2)")
+        model = SentenceTransformer("all-mpnet-base-v2")
     except ImportError:
         console.print("[yellow]sentence-transformers not installed, skipping embeddings[/yellow]")
         return
 
-    # Store in ChromaDB
     try:
         import chromadb
 
         chroma_path = str(config.GRAPH_DIR / "chroma_db")
         client = chromadb.PersistentClient(path=chroma_path)
 
-        # Delete existing collection if it exists
+        # --- Collection 1: graph nodes (richer text) ---
+        texts = []
+        ids = []
+        metadatas = []
+
+        for node in nodes:
+            text = _rich_node_text(node)
+            texts.append(text)
+            ids.append(node["id"])
+            metadatas.append({
+                "type": node["type"],
+                "name": node.get("name") or node["id"],
+                "municipality": node.get("municipality", "encinitas"),
+            })
+
         try:
             client.delete_collection("encinitas_permits")
         except Exception:
@@ -279,7 +308,9 @@ def build_embeddings(nodes: list[dict]):
             metadata={"description": "Encinitas permit knowledge graph nodes"},
         )
 
-        # Add in batches (ChromaDB has limits)
+        console.print(f"  Encoding {len(ids)} node vectors...")
+        embeddings = model.encode(texts, show_progress_bar=True).tolist()
+
         batch_size = 100
         for i in range(0, len(ids), batch_size):
             end = min(i + batch_size, len(ids))
@@ -290,7 +321,78 @@ def build_embeddings(nodes: list[dict]):
                 metadatas=metadatas[i:end],
             )
 
-        console.print(f"  [green]Stored {len(ids)} embeddings in ChromaDB[/green]")
+        console.print(f"  [green]Stored {len(ids)} node embeddings[/green]")
+
+        # --- Collection 2: permit content (full structured JSON per permit) ---
+        p_texts = []
+        p_ids = []
+        p_metadatas = []
+
+        for permit in permits:
+            slug = permit.get("slug", "")
+            name = permit.get("permit_name", slug)
+
+            # Build a rich natural-language summary for embedding
+            parts = [name]
+            if permit.get("description"):
+                parts.append(permit["description"])
+            if permit.get("plain_english_summary"):
+                parts.append(permit["plain_english_summary"])
+
+            always_req = [d.get("name", "") for d in permit.get("always_required", []) if d.get("name")]
+            if always_req:
+                parts.append("Always required: " + ", ".join(always_req))
+
+            cond_req = [d.get("name", "") for d in permit.get("conditionally_required", []) if d.get("name")]
+            if cond_req:
+                parts.append("May require: " + ", ".join(cond_req))
+
+            related = [r.get("name", "") for r in permit.get("related_permits", []) if r.get("name")]
+            if related:
+                parts.append("Related permits: " + ", ".join(related))
+
+            steps = permit.get("process_steps", [])
+            if steps:
+                parts.append("Steps: " + "; ".join(str(s) for s in steps[:6]))
+
+            routing = permit.get("review_routing") or {}
+            divisions = routing.get("divisions", [])
+            if divisions:
+                parts.append("Reviewed by: " + ", ".join(divisions))
+
+            embed_text = ". ".join(p for p in parts if p)
+            p_texts.append(embed_text)
+            p_ids.append(f"permit:{slug}")
+            p_metadatas.append({
+                "slug": slug,
+                "name": name,
+                "department": permit.get("department", ""),
+                "municipality": "encinitas",
+            })
+
+        try:
+            client.delete_collection("encinitas_permit_content")
+        except Exception:
+            pass
+
+        content_collection = client.create_collection(
+            name="encinitas_permit_content",
+            metadata={"description": "Encinitas permit full structured content"},
+        )
+
+        console.print(f"  Encoding {len(p_ids)} permit content vectors...")
+        p_embeddings = model.encode(p_texts, show_progress_bar=True).tolist()
+
+        for i in range(0, len(p_ids), batch_size):
+            end = min(i + batch_size, len(p_ids))
+            content_collection.add(
+                ids=p_ids[i:end],
+                embeddings=p_embeddings[i:end],
+                documents=[json.dumps(permits[j]) for j in range(i, end)],
+                metadatas=p_metadatas[i:end],
+            )
+
+        console.print(f"  [green]Stored {len(p_ids)} permit content embeddings[/green]")
 
     except ImportError:
         console.print("[yellow]chromadb not installed, skipping vector store[/yellow]")
@@ -360,7 +462,7 @@ def main():
     console.print(f"  Total edges after shared facts: {len(edges)}")
 
     # Step 4: Build embeddings
-    build_embeddings(nodes)
+    build_embeddings(nodes, permits)
 
     # Step 5: Save outputs
     console.print("\n[bold]Step 5:[/bold] Saving outputs...")
